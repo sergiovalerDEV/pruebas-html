@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Numerar exportaciones de Figma</title>
+<style>
+:root{--bg:#f4f5f7;--fg:#1d2330;--card:#fff;--line:#dde1e8;--ac:#2f5bea;--ok:#16794a;--er:#c0302b;--wa:#9a6700}
+@media(prefers-color-scheme:dark){:root{--bg:#14171d;--fg:#e8ebf1;--card:#1e222b;--line:#323846;--ac:#7c9bff;--ok:#4cd08a;--er:#ff7b74;--wa:#f0b948}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif}
+main{max-width:860px;margin:0 auto;padding:24px 16px 80px}
+h1{font-size:22px;margin:0 0 4px}
+h2{font-size:15px;margin:0 0 10px}
+section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:14px}
+label{display:inline-flex;gap:8px;align-items:center;margin-right:14px}
+input,select,button{font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:6px 10px}
+input[type=number]{width:70px}
+button{cursor:pointer;background:var(--ac);color:#fff;border-color:var(--ac)}
+button:disabled{opacity:.4;cursor:not-allowed}
+:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
+#msg{position:sticky;top:0;z-index:5;padding:10px 14px;border-radius:8px;margin-bottom:14px;background:var(--card);border:1px solid var(--line);min-height:42px}
+.ok{color:var(--ok)}.er{color:var(--er)}.wa{color:var(--wa)}.sm{font-size:13px;opacity:.85}
+#shot{position:relative;margin-top:12px;touch-action:none;user-select:none;cursor:crosshair}
+#shot img{display:block;width:100%;border-radius:6px}
+.bx{position:absolute;border:2px solid var(--ac);background:#2f5bea22;cursor:pointer}
+.bx:hover{border-color:var(--er);background:#c0302b33}
+.bx::after{content:attr(data-n);position:absolute;top:0;left:0;background:var(--ac);color:#fff;padding:0 6px;font-size:13px;font-weight:700}
+table{width:100%;border-collapse:collapse}
+td,th{padding:6px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}
+td img{height:44px;max-width:80px;object-fit:contain;display:block}
+td select{max-width:200px}
+</style>
+</head>
+<body>
+<main>
+<h1>Numerar exportaciones de Figma</h1>
+<p class="sm">Funciona en Chrome, Edge y otros navegadores Chromium. Firefox y Safari no permiten modificar carpetas.</p>
+
+<div id="msg">Empieza cargando una captura de Figma.</div>
+
+<section>
+  <h2>1. Captura de Figma</h2>
+  <label>Archivo <input type="file" id="in" accept="image/*"></label>
+  <label>Tamaño mínimo (px) <input type="number" id="min" value="40" min="8"></label>
+  <p class="sm">Se detectan las imágenes automáticamente. Lo único que puedes tocar son los recuadros: clic en uno para eliminarlo o arrastra sobre la captura para añadir uno. La numeración sigue el orden de lectura (filas de arriba abajo, de izquierda a derecha).</p>
+  <div id="shot"></div>
+</section>
+
+<section>
+  <h2>2. Categoría y carpeta</h2>
+  <label>Categoría <input id="cat" placeholder="producto" autocomplete="off"></label>
+  <button id="dir" disabled>Elegir carpeta y numerar</button>
+  <p class="sm">Al elegir la carpeta se compara el contenido de cada archivo con las imágenes de la captura (sin importar sus nombres) y se numeran automáticamente según la posición de cada recuadro. Lo que no coincida no se toca. Nunca se sobrescribe ningún archivo.</p>
+</section>
+
+<section>
+  <h2>3. Resultado</h2>
+  <p id="sum" class="sm"></p>
+  <button id="dg" disabled>Descargar diagnóstico</button>
+  <p class="sm">Si algún emparejamiento sale mal, descarga el diagnóstico y envíalo: contiene la captura, las miniaturas, las posiciones de los recuadros y todos los porcentajes de similitud.</p>
+  <table>
+    <thead><tr><th>#</th><th>Captura</th><th>Archivo que coincide</th><th>Nuevo nombre</th><th>Estado</th></tr></thead>
+    <tbody id="tb"><tr><td colspan="5" class="sm">El resultado aparecerá aquí al elegir la carpeta.</td></tr></tbody>
+  </table>
+</section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+// Estado: captura, recuadros (cada uno guarda su firma, miniatura y archivo asignado "a"), carpeta y archivos
+const S = {img:null, boxes:[], dir:null, files:[], names:new Set(), rows:[], sum:'', busy:false};
+
+const msg = (t, c = '') => { const m = $('#msg'); m.textContent = t; m.className = c; };
+const clean = v => v.replace(/[\\/:*?"<>|]/g, '').trim().replace(/\s+/g, '_');
+const wait = () => new Promise(r => setTimeout(r, 30)); // deja pintar el progreso
+const size = i => [i.naturalWidth || i.width || 1, i.naturalHeight || i.height || 1];
+
+const loadImg = f => new Promise((ok, ko) => {
+  const i = new Image();
+  i.onload = () => ok(i);
+  i.onerror = () => ko(new Error('No se pudo leer la imagen'));
+  i.src = URL.createObjectURL(f);
+});
+
+// ============ Motor de comparación v2 ============
+// Cada imagen (recuadro de la captura o archivo) -> "item" con imagen reducida e imagen integral (rejillas rápidas).
+// Para cada par recuadro/archivo se buscan alineaciones: completa, recortada al contenido, cover/contain,
+// ventanas con zoom y desplazamiento (recortes descentrados de Figma) y desplazamientos finos.
+// La puntuación combina color, estructura y bordes, y una variante "recortada" que ignora las zonas tapadas
+// por capas encima (textos, insignias, degradados). El reparto es óptimo global (algoritmo húngaro).
+const R = 160, G = 32, GC = 16, INS = [0, .04, .09], SCALES = [.85, .7, .55];
+
+function raster(src, sx, sy, sw, sh) {
+  const k = Math.min(1, R / Math.max(sw, sh)), cw = Math.max(1, Math.round(sw * k)), ch = Math.max(1, Math.round(sh * k));
+  let cur = src, cx = sx, cy = sy, cW = sw, cH = sh;
+  const mk = (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; const x = c.getContext('2d', {willReadFrequently:true}); x.fillStyle = '#fff'; x.fillRect(0, 0, w, h); x.imageSmoothingQuality = 'high'; return [c, x]; };
+  while (cW / 2 > cw && cH / 2 > ch) {
+    const [c, x] = mk(Math.ceil(cW / 2), Math.ceil(cH / 2));
+    x.drawImage(cur, cx, cy, cW, cH, 0, 0, c.width, c.height); cur = c; cx = cy = 0; cW = c.width; cH = c.height;
+  }
+  const [c, x] = mk(cw, ch);
+  x.drawImage(cur, cx, cy, cW, cH, 0, 0, cw, ch);
+  return c;
+}
+
+function mkItem(src, sx, sy, sw, sh, bg) {
+  if (sw === undefined) [sw, sh] = size(src), sx = sy = 0;
+  const c = raster(src, sx, sy, sw, sh), W = c.width, H = c.height;
+  const d = c.getContext('2d', {willReadFrequently:true}).getImageData(0, 0, W, H).data;
+  const W1 = W + 1, sat = new Float64Array(W1 * (H + 1) * 3);
+  for (let y = 0; y < H; y++) { let r = 0, g = 0, b = 0; for (let x = 0; x < W; x++) {
+    const k = (y * W + x) * 4; r += d[k]; g += d[k+1]; b += d[k+2];
+    const o = ((y + 1) * W1 + x + 1) * 3, u = (y * W1 + x + 1) * 3;
+    sat[o] = sat[u] + r; sat[o+1] = sat[u+1] + g; sat[o+2] = sat[u+2] + b; } }
+  const it = {W, H, d, sat, sw, sh, ar: sw / sh, cache: new Map(), rects: [{x0: 0, y0: 0, x1: W, y1: H}], c};
+  const tight = isBg => {
+    let x0 = W, y0 = H, x1 = -1, y1 = -1;
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (!isBg((y * W + x) * 4)) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+    const w = x1 - x0 + 1, h = y1 - y0 + 1;
+    if (x1 < 0 || w < 8 || h < 8 || (w > W * .97 && h > H * .97)) return;
+    it.rects.push({x0, y0, x1: x1 + 1, y1: y1 + 1});
+  };
+  tight(k => d[k] >= 238 && d[k+1] >= 238 && d[k+2] >= 238);
+  if (bg) tight(k => Math.abs(d[k] - bg[0]) + Math.abs(d[k+1] - bg[1]) + Math.abs(d[k+2] - bg[2]) <= 36);
+  return it;
+}
+// miniatura para mostrar en la tabla
+const thumb = it => { if (!it.th) { const c = document.createElement('canvas'), k = 56 / Math.max(it.W, it.H); c.width = Math.max(1, Math.round(it.W * k)); c.height = Math.max(1, Math.round(it.H * k)); c.getContext('2d').drawImage(it.c, 0, 0, c.width, c.height); it.th = c.toDataURL('image/jpeg', .7); } return it.th; };
+
+const fac = it => it.ar / (it.W / it.H);                       // proporción real / proporción de la rejilla
+const rar = (it, r) => (r.x1 - r.x0) / (r.y1 - r.y0) * fac(it); // proporción real de un recorte
+const inset = (r, f) => { const w = r.x1 - r.x0, h = r.y1 - r.y0; return {x0: r.x0 + w * f, y0: r.y0 + h * f, x1: r.x1 - w * f, y1: r.y1 - h * f}; };
+
+// Rejilla g×g de promedios de color, en O(g²) gracias a la imagen integral
+function feat(it, r, g, nc) {
+  const key = g + ':' + [r.x0, r.y0, r.x1, r.y1].map(v => v.toFixed(1)).join(); let f = nc ? null : it.cache.get(key); if (f) return f;
+  const {W, H, sat} = it, W1 = W + 1, w = r.x1 - r.x0, h = r.y1 - r.y0, rgb = new Float32Array(g * g * 3), gr = new Float32Array(g * g);
+  const cl = (v, m) => v < 0 ? 0 : v > m ? m : v;
+  for (let j = 0; j < g; j++) {
+    const y0 = cl(Math.round(r.y0 + j * h / g), H - 1), y1 = Math.max(y0 + 1, cl(Math.round(r.y0 + (j + 1) * h / g), H));
+    for (let i = 0; i < g; i++) {
+      const x0 = cl(Math.round(r.x0 + i * w / g), W - 1), x1 = Math.max(x0 + 1, cl(Math.round(r.x0 + (i + 1) * w / g), W)), n = (x1 - x0) * (y1 - y0), o = (j * g + i) * 3;
+      for (let c = 0; c < 3; c++) rgb[o + c] = (sat[(y1 * W1 + x1) * 3 + c] - sat[(y0 * W1 + x1) * 3 + c] - sat[(y1 * W1 + x0) * 3 + c] + sat[(y0 * W1 + x0) * 3 + c]) / n;
+      gr[j * g + i] = .3 * rgb[o] + .59 * rgb[o+1] + .11 * rgb[o+2];
+    }
+  }
+  f = {rgb, gr, g};
+  if (g === G) {
+    const edge = new Float32Array(g * g);
+    for (let y = 1; y < g - 1; y++) for (let x = 1; x < g - 1; x++) edge[y * g + x] = Math.abs(gr[y*g + x+1] - gr[y*g + x-1]) + Math.abs(gr[(y+1)*g + x] - gr[(y-1)*g + x]);
+    const lay = new Float32Array(48), q = g / 4;
+    for (let j = 0; j < g; j++) for (let i = 0; i < g; i++) for (let c = 0; c < 3; c++) lay[((j / q | 0) * 4 + (i / q | 0)) * 3 + c] += rgb[(j * g + i) * 3 + c] / (q * q);
+    f.edge = edge; f.lay = lay;
+  }
+  if (!nc) it.cache.set(key, f); return f;
+}
+
+// Promedios de color de un recorte en una rejilla gw×gh (imagen integral)
+function avgGrid(it, r, gw, gh) {
+  const {W, H, sat} = it, W1 = W + 1, w = r.x1 - r.x0, h = r.y1 - r.y0, out = new Float32Array(gw * gh * 3);
+  const cl = (v, m) => v < 0 ? 0 : v > m ? m : v;
+  for (let j = 0; j < gh; j++) {
+    const y0 = cl(Math.round(r.y0 + j * h / gh), H - 1), y1 = Math.max(y0 + 1, cl(Math.round(r.y0 + (j + 1) * h / gh), H));
+    for (let i = 0; i < gw; i++) {
+      const x0 = cl(Math.round(r.x0 + i * w / gw), W - 1), x1 = Math.max(x0 + 1, cl(Math.round(r.x0 + (i + 1) * w / gw), W)), n = (x1 - x0) * (y1 - y0), o = (j * gw + i) * 3;
+      for (let c = 0; c < 3; c++) out[o + c] = (sat[(y1 * W1 + x1) * 3 + c] - sat[(y0 * W1 + x1) * 3 + c] - sat[(y1 * W1 + x0) * 3 + c] + sat[(y0 * W1 + x0) * 3 + c]) / n;
+    }
+  }
+  return out;
+}
+const toGray = a => { const g = new Float32Array(a.length / 3); for (let i = 0; i < g.length; i++) g[i] = .3 * a[i*3] + .59 * a[i*3+1] + .11 * a[i*3+2]; return g; };
+
+// Localiza el archivo B dentro del recuadro A (tamaño y posición desconocidos): correlación en varias escalas,
+// de grueso a fino. Sirve cuando el recuadro incluye texto, márgenes u otras cosas además de la imagen.
+const LC = 44, FR = [1, .9, .8, .71, .63, .56, .5, .44, .39, .34, .3];
+function locate(A, B) {
+  const fa = A.rects[0], fb = B.rects[0], k = LC / Math.max(A.W, A.H), Wc = Math.max(10, Math.round(A.W * k)), Hc = Math.max(10, Math.round(A.H * k));
+  if (!A.cs) {
+    const g = toGray(avgGrid(A, fa, Wc, Hc)), I = new Float64Array((Wc + 1) * (Hc + 1)), I2 = new Float64Array((Wc + 1) * (Hc + 1));
+    for (let y = 0; y < Hc; y++) { let r = 0, r2 = 0; for (let x = 0; x < Wc; x++) { const v = g[y * Wc + x]; r += v; r2 += v * v; I[(y+1)*(Wc+1) + x+1] = I[y*(Wc+1) + x+1] + r; I2[(y+1)*(Wc+1) + x+1] = I2[y*(Wc+1) + x+1] + r2; } }
+    A.cs = {g, I, I2, Wc, Hc};
+  }
+  const {g, I, I2} = A.cs, W1 = Wc + 1, peaks = [];
+  B.tp = B.tp || new Map();
+  for (const [ri, fb] of B.rects.entries()) for (const f of FR) {
+    const asp = (A.ar * A.H / A.W) / rar(B, fb);
+    let tw = Math.round(Wc * f), th = Math.round(tw * asp);
+    if (th > Hc) { th = Hc; tw = Math.round(th / asp); }
+    if (tw < 6 || th < 6 || tw > Wc) continue;
+    const key = ri + ':' + tw + 'x' + th; let t = B.tp.get(key);
+    if (!t) { const a = toGray(avgGrid(B, fb, tw, th)); let m = 0; for (const v of a) m += v; m /= a.length; let nn = 0; for (let i = 0; i < a.length; i++) { a[i] -= m; nn += a[i] * a[i]; } t = {a, nrm: Math.sqrt(nn)}; B.tp.set(key, t); }
+    if (t.nrm < 1e-3) continue;
+    const st = (Wc - tw > 6 || Hc - th > 6) ? 2 : 1; let bst = {s: -1};
+    for (let y = 0; y + th <= Hc; y += st) for (let x = 0; x + tw <= Wc; x += st) {
+      const n = tw * th, sm = I[(y+th)*W1 + x+tw] - I[y*W1 + x+tw] - I[(y+th)*W1 + x] + I[y*W1 + x], sq = I2[(y+th)*W1 + x+tw] - I2[y*W1 + x+tw] - I2[(y+th)*W1 + x] + I2[y*W1 + x];
+      const v = sq - sm * sm / n; if (v < 1e-3) continue;
+      let dot = 0; for (let j = 0; j < th; j++) { const ro = (y + j) * Wc + x, to = j * tw; for (let i = 0; i < tw; i++) dot += t.a[to + i] * g[ro + i]; }
+      const s = dot / (Math.sqrt(v) * t.nrm); if (s > bst.s) bst = {s, x, y, tw, th, fb};
+    }
+    if (bst.s > .2) peaks.push(bst);
+  }
+  peaks.sort((p, q) => q.s - p.s);
+  // convertir los mejores picos en recortes del recuadro (con pequeñas variaciones de tamaño y posición)
+  const kx = A.W / Wc, ky = A.H / Hc, out = [], seen = [];
+  for (const p of peaks) {
+    if (out.length >= 9) break;
+    if (seen.some(q => Math.abs(q.x - p.x) < 3 && Math.abs(q.y - p.y) < 3 && Math.abs(q.tw - p.tw) < 4)) continue; seen.push(p);
+    for (const sc of [.96, 1, 1.04]) for (const [dx, dy] of [[0,0],[-1,0],[1,0],[0,-1],[0,1]]) {
+      const cx = (p.x + p.tw / 2 + dx * .7) * kx, cy = (p.y + p.th / 2 + dy * .7) * ky, w = p.tw * kx * sc, h = p.th * ky * sc;
+      out.push({x0: cx - w / 2, y0: cy - h / 2, x1: cx + w / 2, y1: cy + h / 2, rb: p.fb});
+    }
+  }
+  return out.filter(r => r.x0 > -A.W * .03 && r.y0 > -A.H * .03 && r.x1 < A.W * 1.03 && r.y1 < A.H * 1.03).map(r => ({r: {x0: Math.max(0, r.x0), y0: Math.max(0, r.y0), x1: Math.min(A.W, r.x1), y1: Math.min(A.H, r.y1)}, rb: r.rb}));
+}
+
+// Correlación normalizada (zona interior de margen m; b desplazada (dx,dy))
+function ncc(a, b, g, ch, m, dx, dy) {
+  let n = 0, sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+  for (let y = m; y < g - m; y++) for (let x = m; x < g - m; x++) {
+    const ia = (y * g + x) * ch, ib = ((y + dy) * g + x + dx) * ch;
+    for (let c = 0; c < ch; c++) { const u = a[ia + c], v = b[ib + c]; n++; sa += u; sb += v; saa += u*u; sbb += v*v; sab += u*v; }
+  }
+  const va = n * saa - sa * sa, vb = n * sbb - sb * sb;
+  return va > 1e-6 && vb > 1e-6 ? (n * sab - sa * sb) / Math.sqrt(va * vb) : 0;
+}
+// Parecido robusto a zonas tapadas: diferencia de grises normalizados por bloques; se descarta el 25 % de bloques
+// con más diferencia (una insignia, un texto o un degradado), pero no diferencias repartidas por toda la imagen.
+function trimmed(a, b, g, m, dx, dy) {
+  let n = 0, sa = 0, sb = 0, saa = 0, sbb = 0;
+  for (let y = m; y < g - m; y++) for (let x = m; x < g - m; x++) { const u = a[y * g + x], v = b[(y + dy) * g + x + dx]; n++; sa += u; sb += v; saa += u*u; sbb += v*v; }
+  const ma = sa / n, mb = sb / n, sda = Math.sqrt(Math.max(1e-6, saa / n - ma * ma)), sdb = Math.sqrt(Math.max(1e-6, sbb / n - mb * mb));
+  if (sda < 1.5 || sdb < 1.5) return 0; // imagen plana: no aporta estructura
+  const q = 4, nb = Math.ceil((g - 2 * m) / q), e = new Float64Array(nb * nb), c = new Float64Array(nb * nb);
+  for (let y = m; y < g - m; y++) for (let x = m; x < g - m; x++) {
+    const d = (a[y * g + x] - ma) / sda - (b[(y + dy) * g + x + dx] - mb) / sdb, k = ((y - m) / q | 0) * nb + ((x - m) / q | 0); e[k] += d * d; c[k]++;
+  }
+  const ds = []; for (let k = 0; k < e.length; k++) if (c[k]) ds.push(e[k] / c[k]);
+  ds.sort((p, r) => p - r); const k = Math.floor(ds.length * .75); let t = 0; for (let i = 0; i < k; i++) t += ds[i];
+  return Math.exp(-3 * t / k);
+}
+// Versión barata por bloques 4×4 (para la búsqueda gruesa)
+function trimmedB(a, b, g) {
+  let n = g * g, sa = 0, sb = 0, saa = 0, sbb = 0;
+  for (let i = 0; i < n; i++) { const u = a[i], v = b[i]; sa += u; sb += v; saa += u*u; sbb += v*v; }
+  const ma = sa / n, mb = sb / n, sda = Math.sqrt(Math.max(1e-6, saa / n - ma * ma)), sdb = Math.sqrt(Math.max(1e-6, sbb / n - mb * mb));
+  if (sda < 1.5 || sdb < 1.5) return 0;
+  const q = g / 4, e = new Array(16).fill(0);
+  for (let y = 0; y < g; y++) for (let x = 0; x < g; x++) { const d = (a[y*g+x] - ma) / sda - (b[y*g+x] - mb) / sdb; e[((y / q | 0) * 4) + (x / q | 0)] += d * d; }
+  e.sort((p, r) => p - r); let t = 0; for (let i = 0; i < 11; i++) t += e[i];
+  return Math.exp(-3 * t / (11 * q * q));
+}
+function colSim(a, b) { let t = 0; for (let i = 0; i < 48; i++) t += Math.abs(a[i] - b[i]); return Math.max(0, 1 - t / 48 / 70); }
+
+// Puntuación fina de un par de rejillas G×G
+function fine(a, b, dx, dy) {
+  const rgb = Math.max(0, ncc(a.rgb, b.rgb, G, 3, 3, dx, dy)), edge = Math.max(0, ncc(a.edge, b.edge, G, 1, 3, dx, dy)), col = colSim(a.lay, b.lay);
+  const glob = .45 * rgb + .30 * edge + .25 * col;
+  const tr = trimmed(a.gr, b.gr, G, 3, dx, dy);
+  return Math.max(glob, .88 * (.65 * tr + .35 * Math.max(edge, rgb)));
+}
+const SH = [[0,0],[-1,0],[1,0],[0,-1],[0,1],[-2,0],[2,0],[0,-2],[0,2],[-1,-1],[1,1],[-1,1],[1,-1],[-2,-2],[2,2],[-2,2],[2,-2]];
+
+// Ventana de proporción real `ar` dentro de un item, a escala s y posición (u,v) en [0,1]
+function win(it, ar, s, u, v) {
+  const f = fac(it), want = ar / f; let w, h;
+  if (it.W / it.H > want) { h = it.H; w = h * want; } else { w = it.W; h = w / want; }
+  w *= s; h *= s; const x0 = (it.W - w) * u, y0 = (it.H - h) * v; return {x0, y0, x1: x0 + w, y1: y0 + h};
+}
+
+const wpen = (s, u, v) => 1 - .22 * (1 - s) - .02 * Math.min(1, Math.hypot(u - .5, v - .5) * 2);
+function cands(A, B, withWin) {
+  const out = [], fa = A.rects[0], fb = B.rects[0], ara = rar(A, fa), arb = rar(B, fb);
+  for (const ra of A.rects) for (const f of INS) { const r = f ? inset(ra, f) : ra; for (const rb of B.rects) if (Math.abs(Math.log(rar(A, r) / rar(B, rb))) < .12) out.push([r, rb, 1]); }
+  if (Math.abs(Math.log(ara / arb)) >= .06) {
+    for (const f of INS) { out.push([f ? inset(fa, f) : fa, win(B, ara, 1, .5, .5), 1]); out.push([win(A, arb, 1, .5, .5), f ? inset(fb, f * .5) : fb, 1]); }
+  }
+  if (Math.abs(Math.log(ara / arb)) >= .12) out.push([fa, fb, .9]);
+  if (withWin) for (const s of [1, ...SCALES]) for (const u of [0, .5, 1]) for (const v of [0, .5, 1]) {
+    if (s === 1 && u === .5 && v === .5) continue;
+    const pen = wpen(s, u, v);
+    out.push([fa, win(B, ara, s, u, v), pen, {side: 'B', s, u, v}]); out.push([win(A, arb, s, u, v), fb, pen, {side: 'A', s, u, v}]);
+  }
+  return out;
+}
+function coarse(A, B, cs) {
+  return cs.map(([ra, rb, pen, meta]) => { const a = feat(A, ra, GC), b = feat(B, rb, GC); return {ra, rb, pen, meta, s: pen * (.6 * Math.max(0, ncc(a.rgb, b.rgb, GC, 3, 1, 0, 0)) + .4 * trimmedB(a.gr, b.gr, GC))}; }).sort((x, y) => y.s - x.s);
+}
+
+// Afinado continuo de la alineación: se mueve y escala la ventana de un lado (A: recuadro, B: archivo) con pasos cada vez
+// más pequeños hasta maximizar la puntuación fina. Recupera lo que la rejilla gruesa no ve (subtítulos, bordes, medio píxel).
+function refineSide(A, B, ra, rb, pen, side) {
+  const X = side === 'A' ? A : B, Y = side === 'A' ? B : A, rx = side === 'A' ? ra : rb, ry = side === 'A' ? rb : ra;
+  const tar = rar(Y, ry); if (Math.abs(Math.log(rar(X, rx) / tar)) > .15) return {s: 0};
+  const fy = feat(Y, ry, G), f = fac(X);
+  const mk = (cx, cy, w) => { const h = w * f / tar; return {x0: cx - w / 2, y0: cy - h / 2, x1: cx + w / 2, y1: cy + h / 2}; };
+  const ok = r => r.x0 >= -X.W * .02 && r.y0 >= -X.H * .02 && r.x1 <= X.W * 1.02 && r.y1 <= X.H * 1.02 && r.x1 - r.x0 > X.W * .15 && r.y1 - r.y0 > X.H * .15;
+  const cl = r => ({x0: Math.max(0, r.x0), y0: Math.max(0, r.y0), x1: Math.min(X.W, r.x1), y1: Math.min(X.H, r.y1)});
+  const sc = r => { const fx = feat(X, cl(r), G, true); return pen * (side === 'A' ? fine(fx, fy, 0, 0) : fine(fy, fx, 0, 0)); };
+  let best = {cx: (rx.x0 + rx.x1) / 2, cy: (rx.y0 + rx.y1) / 2, w: rx.x1 - rx.x0}; best.s = sc(mk(best.cx, best.cy, best.w));
+  for (const [sp, ss] of [[.03, .04], [.015, .02], [.007, .01], [.003, .005]]) for (let rep = 0; rep < 5; rep++) {
+    let imp = false, b0 = best;
+    for (const dx of [-1, 0, 1]) for (const dy of [-1, 0, 1]) for (const dw of [-1, 0, 1]) {
+      if (!dx && !dy && !dw) continue;
+      const c = {cx: b0.cx + dx * sp * X.W, cy: b0.cy + dy * sp * X.H, w: b0.w * (1 + dw * ss)}, r = mk(c.cx, c.cy, c.w); if (!ok(r)) continue;
+      const v = sc(r); if (v > best.s + 1e-4) { best = {...c, s: v}; imp = true; }
+    }
+    if (!imp) break;
+  }
+  return {s: best.s, r: cl(mk(best.cx, best.cy, best.w))};
+}
+
+// Similitud (0..1) entre un recuadro A y un archivo B: mejor alineación posible
+function simil(A, B) {
+  let sc = coarse(A, B, cands(A, B, false));
+  if (!sc.length || sc[0].s < .9) sc = coarse(A, B, cands(A, B, true)); // solo se buscan recortes/zoom si lo básico no encaja
+  if (!sc.length || sc[0].s < LOC_T) { // el recuadro probablemente trae contenido extra (texto, márgenes…): se localiza el archivo dentro
+    const ex = locate(A, B).filter(({r}) => (r.x1 - r.x0) * (r.y1 - r.y0) < .97 * A.W * A.H).map(({r, rb}) => [r, rb, .95]);
+    if (ex.length) sc = sc.concat(coarse(A, B, ex)).sort((x, y) => y.s - x.s);
+  }
+  // afinado local de la mejor ventana (zoom/posición intermedios que la rejilla gruesa no cubre)
+  if (sc.length && sc[0].meta && sc[0].s > .3) {
+    const fa = A.rects[0], fb = B.rects[0], ara = rar(A, fa), arb = rar(B, fb); let cur = sc[0];
+    for (const st of [.12, .06, .03]) for (let rep = 0; rep < 2; rep++) {
+      const nb = [];
+      for (const ds of [-st, 0, st]) for (const du of [-st * 2, 0, st * 2]) for (const dv of [-st * 2, 0, st * 2]) {
+        if (!ds && !du && !dv) continue;
+        const m = cur.meta, s2 = Math.min(1, Math.max(.35, m.s + ds)), u2 = Math.min(1, Math.max(0, m.u + du)), v2 = Math.min(1, Math.max(0, m.v + dv)), pen = wpen(s2, u2, v2);
+        nb.push(m.side === 'B' ? [fa, win(B, ara, s2, u2, v2), pen, {side: 'B', s: s2, u: u2, v: v2}] : [win(A, arb, s2, u2, v2), fb, pen, {side: 'A', s: s2, u: u2, v: v2}]);
+      }
+      const top = coarse(A, B, nb)[0]; if (top.s > cur.s) cur = top; else break;
+    }
+    sc.unshift(cur);
+  }
+  let best = 0, top = null;
+  for (const [ci, {ra, rb, pen}] of sc.slice(0, 3).entries()) {
+    const a = feat(A, ra, G), b = feat(B, rb, G);
+    for (const [dx, dy] of ci ? SH.slice(0, 5) : SH) { const v = pen * fine(a, b, dx, dy); if (v > best) { best = v; top = {ra, rb, pen}; } }
+  }
+  if (top && best > .45) {
+    for (const side of ['A', 'B']) {
+      const r = refineSide(A, B, top.ra, top.rb, top.pen, side);
+      if (r.s > best) { best = r.s; top = side === 'A' ? {ra: r.r, rb: top.rb, pen: top.pen} : {ra: top.ra, rb: r.r, pen: top.pen}; }
+    }
+  }
+  return {s: Math.min(1, best), al: top};
+}
+
+// Verificación estricta a alta resolución (64×64) sobre la alineación ya encontrada: compara bloque a bloque en
+// estructura y color, y solo descarta el 15 % de bloques más distintos (una insignia o un texto). Es lo que separa
+// imágenes casi idénticas, donde la comparación tolerante no basta.
+const ST = {g: 48, cw: 3, keep: .85, k: 2, px: 4.5, clip: 2};
+function strict(A, B, al) {
+  // resolución de comparación según el detalle real disponible (una captura pequeña no tiene detalle fino que comparar)
+  const nat = (it, r) => (r.x1 - r.x0) / it.W * it.sw, g = Math.max(24, Math.min(ST.g, 8 * Math.round(Math.min(nat(A, al.ra), nat(B, al.rb)) / ST.px / 8))), q = g / 8, m = 3;
+  const fa = feat(A, al.ra, g, true), fb = feat(B, al.rb, g, true);
+  let best = 0;
+  for (const [dx, dy] of [[0,0],[-1,0],[1,0],[0,-1],[0,1],[-1,-1],[1,1],[-1,1],[1,-1]]) {
+    let n = 0, sa = 0, sb = 0, saa = 0, sbb = 0;
+    for (let y = m; y < g - m; y++) for (let x = m; x < g - m; x++) { const u = fa.gr[y * g + x], v = fb.gr[(y + dy) * g + x + dx]; n++; sa += u; sb += v; saa += u*u; sbb += v*v; }
+    const ma = sa / n, mb = sb / n, sda = Math.sqrt(Math.max(1e-6, saa / n - ma * ma)), sdb = Math.sqrt(Math.max(1e-6, sbb / n - mb * mb));
+    if (sda < 1.5 || sdb < 1.5) continue;
+    const nb = Math.ceil((g - 2 * m) / q), e = new Float64Array(nb * nb), c = new Float64Array(nb * nb);
+    for (let y = m; y < g - m; y++) for (let x = m; x < g - m; x++) {
+      const ia = y * g + x, ib = (y + dy) * g + x + dx, z = (fa.gr[ia] - ma) / sda - (fb.gr[ib] - mb) / sdb;
+      const cd = (Math.abs(fa.rgb[ia*3] - fb.rgb[ib*3]) + Math.abs(fa.rgb[ia*3+1] - fb.rgb[ib*3+1]) + Math.abs(fa.rgb[ia*3+2] - fb.rgb[ib*3+2])) / 765;
+      const k = ((y - m) / q | 0) * nb + ((x - m) / q | 0); e[k] += Math.min(z * z, ST.clip) + ST.cw * cd; c[k]++;
+    }
+    const ds = []; for (let k = 0; k < e.length; k++) if (c[k]) ds.push(e[k] / c[k]);
+    ds.sort((p, r) => p - r); const kk = Math.max(1, Math.floor(ds.length * ST.keep)); let t = 0; for (let i = 0; i < kk; i++) t += ds[i];
+    best = Math.max(best, Math.exp(-ST.k * t / kk));
+  }
+  return best;
+}
+
+function hungarian(sc) {
+  const n0 = sc.length, m0 = n0 ? sc[0].length : 0, n = Math.max(n0, m0), INF = 1e9;
+  const cost = (i, j) => (i < n0 && j < m0 ? -sc[i][j] : 0);
+  const u = new Array(n + 1).fill(0), v = new Array(n + 1).fill(0), p = new Array(n + 1).fill(0), way = new Array(n + 1).fill(0);
+  for (let i = 1; i <= n; i++) {
+    p[0] = i; let j0 = 0; const minv = new Array(n + 1).fill(INF), used = new Array(n + 1).fill(false);
+    do {
+      used[j0] = true; const i0 = p[j0]; let d = INF, j1 = 0;
+      for (let j = 1; j <= n; j++) if (!used[j]) {
+        const cur = cost(i0 - 1, j - 1) - u[i0] - v[j];
+        if (cur < minv[j]) { minv[j] = cur; way[j] = j0; }
+        if (minv[j] < d) { d = minv[j]; j1 = j; }
+      }
+      for (let j = 0; j <= n; j++) if (used[j]) { u[p[j]] += d; v[j] -= d; } else minv[j] -= d;
+      j0 = j1;
+    } while (p[j0] !== 0);
+    do { const j1 = way[j0]; p[j0] = p[j1]; j0 = j1; } while (j0);
+  }
+  const res = new Array(n0).fill(-1);
+  for (let j = 1; j <= n; j++) if (p[j] && p[j] - 1 < n0 && j - 1 < m0) res[p[j] - 1] = j - 1;
+  return res;
+}
+
+const T_OK = .70, T_LOW = .38, LOC_T = .5;
+async function match(progress) {
+  const B = S.boxes, F = S.files, sc = B.map(() => F.map(() => 0)), al = B.map(() => F.map(() => null)); S.sc = sc;
+  for (let i = 0; i < B.length; i++) {
+    if (progress) { progress(i + 1, B.length); await wait(); }
+    F.forEach((f, j) => { if (f.it && B[i].it) { const r = simil(B[i].it, f.it); sc[i][j] = r.s; al[i][j] = r.al; } });
+  }
+  // verificación estricta de los pares plausibles; la nota final mezcla la comparación tolerante y la estricta
+  for (let i = 0; i < B.length; i++) {
+    if (progress) { progress(i + 1, B.length, 'verificando'); await wait(); }
+    F.forEach((f, j) => { if (sc[i][j] >= .5 && al[i][j]) sc[i][j] = .5 * sc[i][j] + .5 * strict(B[i].it, f.it, al[i][j]); });
+  }
+  B.forEach((b, i) => {
+    b.a = -1; b.c = 0; b.how = ''; b.m = 0;
+    const o = sc[i].map((s, j) => [s, j]).sort((x, y) => y[0] - x[0]); b.best = o.length ? {j: o[0][1], c: o[0][0]} : null; b.top = o.slice(0, 3);
+  });
+  const as = hungarian(sc), used = new Set();
+  as.forEach((j, i) => { if (j >= 0 && sc[i][j] >= T_OK) { B[i].a = j; B[i].c = sc[i][j]; B[i].how = 'ok'; used.add(j); } });
+  const rb = B.map((_, i) => i).filter(i => B[i].a < 0), rf = F.map((_, j) => j).filter(j => !used.has(j) && F[j].it);
+  if (rb.length && rf.length) {
+    const r2 = hungarian(rb.map(i => rf.map(j => sc[i][j])));
+    r2.forEach((jj, k) => { if (jj >= 0) { const i = rb[k], j = rf[jj]; if (sc[i][j] >= T_LOW) { B[i].a = j; B[i].c = sc[i][j]; B[i].how = 'elim'; } } });
+  }
+  // margen: diferencia con el mejor candidato alternativo (por fila y por columna)
+  B.forEach((b, i) => { if (b.a < 0) return; let o = 0; F.forEach((_, j) => { if (j !== b.a) o = Math.max(o, sc[i][j]); }); B.forEach((_, k) => { if (k !== i) o = Math.max(o, sc[k][b.a]); }); b.m = b.c - o; });
+}
+
+// Completa un recuadro: firma para comparar, miniatura para mostrar y sin archivo asignado
+function prep(b) {
+  b.it = mkItem(S.img, b.x, b.y, b.w, b.h, S.bg); b.a = -1;
+  const t = document.createElement('canvas'), k = 88 / Math.max(b.w, b.h);
+  t.width = Math.max(1, b.w * k); t.height = Math.max(1, b.h * k);
+  t.getContext('2d').drawImage(S.img, b.x, b.y, b.w, b.h, 0, 0, t.width, t.height);
+  b.th = t.toDataURL();
+  return b;
+}
+
+// Orden de lectura: filas de arriba abajo, cada fila de izquierda a derecha
+function order(a) {
+  const rows = [];
+  a.sort((p, q) => p.y - q.y).forEach(b => {
+    const r = rows.find(r => b.y < r.y + r.h * .5);
+    r ? r.items.push(b) : rows.push({y: b.y, h: b.h, items: [b]});
+  });
+  return rows.flatMap(r => r.items.sort((p, q) => p.x - q.x));
+}
+
+// Detección: píxeles distintos del fondo -> celdas -> componentes conexos -> filtro por tamaño y densidad
+function detect(img, min) {
+  const [W, H] = size(img), c = document.createElement('canvas'); c.width = W; c.height = H;
+  const x = c.getContext('2d', {willReadFrequently:true}); x.drawImage(img, 0, 0);
+  const d = x.getImageData(0, 0, W, H).data;
+
+  // Fondo = color más frecuente del borde de la captura
+  const cnt = {}; let best = 0, bg = [255, 255, 255];
+  const edge = (px, py) => {
+    const i = (py * W + px) * 4, k = (d[i] >> 3) + ',' + (d[i+1] >> 3) + ',' + (d[i+2] >> 3);
+    if ((cnt[k] = (cnt[k] || 0) + 1) > best) { best = cnt[k]; bg = [d[i], d[i+1], d[i+2]]; }
+  };
+  for (let px = 0; px < W; px++) { edge(px, 0); edge(px, H - 1); }
+  for (let py = 0; py < H; py++) { edge(0, py); edge(W - 1, py); }
+
+  S.bg = bg;
+  const G = 3, gw = Math.ceil(W / G), gh = Math.ceil(H / G), cells = new Uint16Array(gw * gh);
+  for (let py = 0; py < H; py++) for (let px = 0; px < W; px++) {
+    const i = (py * W + px) * 4;
+    if (Math.abs(d[i] - bg[0]) + Math.abs(d[i+1] - bg[1]) + Math.abs(d[i+2] - bg[2]) > 36) cells[(py / G | 0) * gw + (px / G | 0)]++;
+  }
+
+  // Dilatación de 1 celda para unir elementos cercanos
+  const dil = new Uint8Array(gw * gh);
+  for (let cy = 0; cy < gh; cy++) for (let cx = 0; cx < gw; cx++) if (cells[cy * gw + cx])
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const nx = cx + dx, ny = cy + dy;
+      if (nx >= 0 && ny >= 0 && nx < gw && ny < gh) dil[ny * gw + nx] = 1;
+    }
+
+  const seen = new Uint8Array(gw * gh), out = [];
+  for (let s = 0; s < dil.length; s++) {
+    if (!dil[s] || seen[s]) continue;
+    let x0 = 1e9, y0 = 1e9, x1 = -1, y1 = -1, sum = 0; const st = [s]; seen[s] = 1;
+    while (st.length) {
+      const p = st.pop(), cx = p % gw, cy = p / gw | 0;
+      if (cells[p]) { sum += cells[p]; x0 = Math.min(x0, cx); y0 = Math.min(y0, cy); x1 = Math.max(x1, cx); y1 = Math.max(y1, cy); }
+      for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+        const nx = cx + dx, ny = cy + dy, q = ny * gw + nx;
+        if (nx >= 0 && ny >= 0 && nx < gw && ny < gh && dil[q] && !seen[q]) { seen[q] = 1; st.push(q); }
+      }
+    }
+    if (x1 < 0) continue;
+    const b = {x: x0 * G, y: y0 * G, w: Math.min((x1 - x0 + 1) * G, W - x0 * G), h: Math.min((y1 - y0 + 1) * G, H - y0 * G)};
+    // Los textos (12-14 px) son finos y de baja densidad; las imágenes son grandes y densas
+    if (b.w >= min && b.h >= min && sum / (b.w * b.h) > .5) out.push(prep(b));
+  }
+  return order(out);
+}
+
+async function analyze() {
+  const f = $('#in').files[0]; if (!f) return;
+  try {
+    msg('Analizando captura…'); await wait();
+    S.img = await loadImg(f); S.img.draggable = false;
+    S.boxes = detect(S.img, +$('#min').value || 40);
+    S.rows = []; S.sum = '';
+    showShot(); table();
+    S.boxes.length
+      ? msg(`✔ ${S.boxes.length} imágenes detectadas. Corrige los recuadros si hace falta, escribe la categoría y elige la carpeta.`, 'ok')
+      : msg('No se detectó ninguna imagen. Baja el tamaño mínimo o dibújalas arrastrando sobre la captura.', 'er');
+  } catch (e) { msg(e.message, 'er'); }
+}
+
+function showShot() {
+  const v = $('#shot'), [W, H] = size(S.img); v.innerHTML = ''; v.append(S.img);
+  S.boxes.forEach((b, i) => {
+    const e = document.createElement('div');
+    e.className = 'bx'; e.dataset.n = i + 1; e.title = 'Clic para eliminar';
+    e.style.cssText = `left:${b.x/W*100}%;top:${b.y/H*100}%;width:${b.w/W*100}%;height:${b.h/H*100}%`;
+    e.onclick = () => { S.boxes.splice(i, 1); S.rows = []; S.sum = ''; showShot(); table(); };
+    v.append(e);
+  });
+}
+
+// Añadir un recuadro arrastrando sobre la captura
+$('#shot').onpointerdown = e => {
+  if (!S.img || e.target.classList.contains('bx')) return;
+  e.preventDefault();
+  const r = S.img.getBoundingClientRect(), k = size(S.img)[0] / r.width, t = document.createElement('div');
+  const box = ev => {
+    const x = Math.max(0, Math.min(e.clientX, ev.clientX) - r.left), y = Math.max(0, Math.min(e.clientY, ev.clientY) - r.top);
+    return {x, y, w: Math.min(Math.abs(ev.clientX - e.clientX), r.width - x), h: Math.min(Math.abs(ev.clientY - e.clientY), r.height - y)};
+  };
+  t.className = 'bx'; t.style.pointerEvents = 'none'; $('#shot').append(t);
+  const mv = ev => { const b = box(ev); t.style.cssText = `left:${b.x}px;top:${b.y}px;width:${b.w}px;height:${b.h}px;pointer-events:none`; };
+  const up = ev => {
+    removeEventListener('pointermove', mv); removeEventListener('pointerup', up); t.remove();
+    const b = box(ev);
+    if (b.w > 10 && b.h > 10) {
+      S.boxes = order([...S.boxes, prep({x: b.x*k, y: b.y*k, w: b.w*k, h: b.h*k})]);
+      S.rows = []; S.sum = '';
+      showShot(); table();
+    }
+  };
+  addEventListener('pointermove', mv); addEventListener('pointerup', up);
+};
+
+const note = b => b.how === 'elim' ? ' (por eliminación: revísalo)' : b.m < .1 ? ` (ambigua, margen ${Math.round(Math.max(0, b.m) * 100)}%: revísalo)` : '';
+const ctl = () => { $('#dir').disabled = S.busy || !(S.img && S.boxes.length && clean($('#cat').value)); };
+
+async function pick() {
+  const cat = clean($('#cat').value);
+  if (!S.img || !S.boxes.length) return msg('Carga primero una captura con imágenes detectadas.', 'er');
+  if (!cat) return msg('Escribe una categoría.', 'er');
+  if (!window.showDirectoryPicker) return msg('Este navegador no permite acceder a carpetas. Usa Chrome o Edge.', 'er');
+  try { S.dir = await showDirectoryPicker({mode: 'readwrite'}); }
+  catch (e) { return e.name === 'AbortError' ? 0 : msg('No se pudo abrir la carpeta: ' + e.message, 'er'); }
+
+  S.busy = true; ctl();
+  try {
+    msg('Leyendo carpeta…'); S.files = []; S.names = new Set(); S.rows = []; S.sum = '';
+    for await (const [n, h] of S.dir.entries()) {
+      S.names.add(n.toLowerCase());
+      if (h.kind === 'file' && /\.(png|jpe?g|webp|gif|svg|avif|bmp)$/i.test(n)) S.files.push({name: n, handle: h});
+    }
+    if (!S.files.length) { table(); return msg('La carpeta no contiene imágenes.', 'er'); }
+    S.files.sort((a, b) => a.name.localeCompare(b.name, undefined, {numeric: true}));
+    let k = 0;
+    for (const f of S.files) {
+      msg(`Comparando archivos ${++k}/${S.files.length}…`); await wait();
+      try { f.it = mkItem(await loadImg(await f.handle.getFile())); } catch { f.it = null; }
+    }
+    await match((i, n, ph) => msg(ph ? `Verificando coincidencias ${i}/${n}…` : `Comparando recuadro ${i}/${n} con la carpeta…`));
+    plan(cat); table();
+    await apply();
+  } catch (e) { msg('Error: ' + e.message, 'er'); }
+  finally { S.busy = false; table(); }
+}
+
+// Plan: cada recuadro k (por posición) da el número k+1 al archivo que coincide con él
+function plan(cat) {
+  const pad = Math.max(2, String(S.boxes.length).length);
+  S.rows = S.boxes.map((b, k) => {
+    const f = S.files[b.a], r = {b, k, f, old: f ? f.name : '', nn: '', st: '', cl: '', go: false};
+    if (!f) {
+      const t = b.best ? ` (más parecido: ${S.files[b.best.j].name}, ${Math.round(Math.max(0, b.best.c) * 100)}%)` : '';
+      r.st = 'Sin coincidencia: no se renombra' + t; r.cl = 'wa'; return r;
+    }
+    r.nn = String(k + 1).padStart(pad, '0') + '_' + cat + f.name.slice(f.name.lastIndexOf('.'));
+    if (f.name === r.nn) { r.st = `Ya tenía ese nombre · similitud ${Math.round(b.c * 100)}%` + note(b); r.cl = 'ok'; } else r.go = true;
+    return r;
+  });
+  // Un destino ocupado solo es válido si su dueño también se va a renombrar (p. ej. al repetir la numeración)
+  for (let ch = true; ch;) {
+    ch = false;
+    const moving = new Set(S.rows.filter(r => r.go).map(r => r.old.toLowerCase()));
+    S.rows.forEach(r => {
+      if (r.go && S.names.has(r.nn.toLowerCase()) && !moving.has(r.nn.toLowerCase())) {
+        r.go = false; r.st = 'Conflicto: ya existe ese nombre, no se renombra'; r.cl = 'er'; ch = true;
+      }
+    });
+  }
+}
+
+function table() {
+  const tb = $('#tb'); tb.innerHTML = ''; ctl(); $('#dg').disabled = !(S.sc && S.rows.length);
+  if (!S.rows.length) {
+    tb.innerHTML = '<tr><td colspan="5" class="sm">El resultado aparecerá aquí al elegir la carpeta.</td></tr>';
+    $('#sum').textContent = ''; return;
+  }
+  S.rows.forEach(r => {
+    const tr = tb.insertRow();
+    tr.innerHTML = `<td>${r.k + 1}</td><td><img src="${r.b.th}" alt=""></td><td></td><td></td><td class="${r.cl}"></td>`;
+    if (r.f && r.f.it) { const im = new Image(); im.src = thumb(r.f.it); im.alt = ''; tr.cells[2].append(im, ' '); } tr.cells[2].append(r.old || '—'); tr.cells[3].textContent = r.nn || '—'; tr.cells[4].textContent = r.st || 'Pendiente';
+  });
+  $('#sum').textContent = S.sum;
+}
+
+function diag() {
+  const c = document.createElement('canvas'), k = Math.min(1, 1600 / Math.max(S.img.naturalWidth || S.img.width, S.img.naturalHeight || S.img.height));
+  c.width = Math.round((S.img.naturalWidth || S.img.width) * k); c.height = Math.round((S.img.naturalHeight || S.img.height) * k); c.getContext('2d').drawImage(S.img, 0, 0, c.width, c.height);
+  const o = {version: 2, captura: c.toDataURL('image/jpeg', .85), escala: k,
+    recuadros: S.boxes.map((b, i) => ({n: i + 1, x: b.x, y: b.y, w: b.w, h: b.h, img: b.it && b.it.c.toDataURL('image/jpeg', .9), asignado: b.a >= 0 ? S.files[b.a].name : null, similitud: +(b.c || 0).toFixed(3), modo: b.how, margen: +(b.m || 0).toFixed(3), mejores: (b.top || []).map(([v, j]) => [S.files[j].name, +v.toFixed(3)])})),
+    archivos: S.files.map(f => ({nombre: f.name, img: f.it ? f.it.c.toDataURL('image/jpeg', .9) : null})),
+    matriz: (S.sc || []).map(r => r.map(v => +v.toFixed(3)))};
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([JSON.stringify(o)], {type: 'application/json'})); a.download = 'diagnostico.json'; a.click();
+}
+const exists = async n => { try { await S.dir.getFileHandle(n); return true; } catch { return false; } };
+
+async function renameTo(f, name) {
+  if (await exists(name)) throw new Error('ya existe ' + name); // nunca sobrescribir
+  const old = f.name;
+  try { await f.handle.move(name); }                          // renombrado directo si el navegador lo permite
+  catch {                                                     // alternativa: copiar con el nuevo nombre y borrar el original
+    const h = await S.dir.getFileHandle(name, {create: true}), w = await h.createWritable();
+    await w.write(await f.handle.getFile()); await w.close();
+    await S.dir.removeEntry(old); f.handle = h;
+  }
+  S.names.delete(old.toLowerCase()); S.names.add(name.toLowerCase()); f.name = name;
+}
+
+async function apply() {
+  const list = S.rows.filter(r => r.go); let ok = 0, bad = 0, k = 0;
+  // Si algún destino coincide con el nombre actual de otro archivo a renombrar, se pasa antes por un nombre temporal
+  const cur = new Set(list.map(r => r.old.toLowerCase()));
+  const tmp = list.some(r => cur.has(r.nn.toLowerCase()));
+  const ext = n => n.slice(n.lastIndexOf('.'));
+  const fail = (r, e) => { r.st = 'Error: ' + e.message; r.cl = 'er'; r.go = false; bad++; };
+
+  if (tmp) for (const r of list) {
+    try { await renameTo(r.f, `__tmp_${Date.now()}_${r.k}${ext(r.old)}`); } catch (e) { fail(r, e); }
+  }
+  for (const r of list) {
+    if (!r.go && r.cl === 'er') continue;
+    msg(`Numerando ${++k}/${list.length}…`); await wait();
+    try { await renameTo(r.f, r.nn); r.st = `Renombrado · similitud ${Math.round(r.b.c * 100)}%` + note(r.b); r.cl = note(r.b) ? 'wa' : 'ok'; ok++; }
+    catch (e) {
+      fail(r, e);
+      if (tmp) { try { await renameTo(r.f, r.old); } catch {} } // intenta devolver el nombre original
+    }
+  }
+  const same = S.rows.filter(r => r.st.startsWith('Ya tenía ese nombre')).length;
+  const none = S.rows.filter(r => !r.f).length;
+  const used = new Set(S.boxes.map(b => b.a).filter(a => a >= 0));
+  const left = S.files.filter((_, j) => !used.has(j)).map(f => f.name);
+  S.sum = `${ok} renombrados · ${same} ya correctos · ${none} recuadros sin coincidencia · ${left.length} archivos de la carpeta sin coincidencia en la captura` +
+    (left.length ? ` (${left.slice(0, 8).join(', ')}${left.length > 8 ? '…' : ''})` : '');
+  table();
+  msg(bad ? `Numeración terminada con ${bad} errores. Revisa la tabla.`
+          : none ? `✔ ${ok + same} imágenes numeradas. ${none} recuadros sin coincidencia en la carpeta.` : `✔ ${ok + same} imágenes numeradas automáticamente.`,
+      bad ? 'er' : none ? 'wa' : 'ok');
+}
+
+$('#in').onchange = analyze;
+$('#min').onchange = analyze;
+$('#cat').oninput = ctl;
+$('#dir').onclick = pick;
+$('#dg').onclick = diag;
+</script>
+</body>
+</html>
