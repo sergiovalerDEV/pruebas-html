@@ -1,0 +1,59 @@
+1. Añade esta función justo encima de function detect(img, min) {:
+
+js
+// Parte un componente en recuadros independientes si lo atraviesa una línea de corte recta (borde o franja)
+const SEP = {w: 3, B: 16, eps: 5, thr: .8};
+function splitBox(d, W, b, min) {
+  const {w, B, eps, thr} = SEP;
+  const gray = (x, y) => { const i = (y * W + x) * 4; return .3 * d[i] + .59 * d[i+1] + .11 * d[i+2]; };
+  const cut = ax => {                                   // ax 0: línea vertical, ax 1: horizontal
+    const n = ax ? b.h : b.w, L = ax ? b.w : b.h, nb = L / B | 0;
+    if (nb < 2 || n < 2 * min + 2 * w) return null;
+    const at = (c, l) => ax ? gray(b.x + l, b.y + c) : gray(b.x + c, b.y + l);
+    const D = new Float32Array(nb * n);                 // salto de brillo a través de la columna/fila c, por bloque
+    for (let c = w; c <= n - w; c++) for (let k = 0; k < nb; k++) {
+      let s = 0;
+      for (let l = k * B; l < (k + 1) * B; l++) for (let j = 0; j < w; j++) s += at(c + j, l) - at(c - 1 - j, l);
+      D[k * n + c] = s / (B * w);
+    }
+    const track = (sg, c0) => {                         // sigue la línea desde el bloque central, deriva ≤2 px por bloque
+      let t = 0, lo = c0, hi = c0; const mid = nb >> 1;
+      for (const ks of [Array.from({length: nb - mid}, (_, i) => mid + i), Array.from({length: mid}, (_, i) => mid - 1 - i)]) {
+        let p = c0;
+        for (const k of ks) {
+          let bq = p, bv = -1e9;
+          for (let q = Math.max(w, p - 2); q <= Math.min(n - w, p + 2); q++) { const v = sg * D[k * n + q]; if (v > bv) { bv = v; bq = q; } }
+          p = bq; if (bv >= eps) t++; lo = Math.min(lo, p); hi = Math.max(hi, p);
+        }
+      }
+      return {v: t / nb, lo, hi};
+    };
+    let best = {v: 0};
+    for (const sg of [1, -1]) for (let c = min; c <= n - min; c++) { const t = track(sg, c); if (t.v > best.v) best = {...t, sg, c}; }
+    if (best.v < thr) return null;
+    let lo = best.lo, hi = best.hi, gut = Math.max(24, n * .04), o = {v: 0};   // ¿hay un segundo borde de signo opuesto? => franja
+    for (let c = Math.max(min, best.c - gut | 0); c <= Math.min(n - min, best.c + gut); c++) { const t = track(-best.sg, c); if (t.v > o.v) o = t; }
+    if (o.v >= thr) { lo = Math.min(lo, o.lo); hi = Math.max(hi, o.hi); }
+    if (lo < min || n - hi < min) return null;
+    return {v: best.v, ax, lo, hi};
+  };
+  const c0 = cut(0), c1 = cut(1), c = c0 && c1 ? (c0.v >= c1.v ? c0 : c1) : c0 || c1;
+  if (!c) return [b];
+  const P = c.ax
+    ? [{x: b.x, y: b.y, w: b.w, h: c.lo}, {x: b.x, y: b.y + c.hi, w: b.w, h: b.h - c.hi}]
+    : [{x: b.x, y: b.y, w: c.lo, h: b.h}, {x: b.x + c.hi, y: b.y, w: b.w - c.hi, h: b.h}];
+  return P.flatMap(p => splitBox(d, W, p, min));
+}
+
+2. Dentro de detect(), sustituye esta única línea (la última del bucle de componentes):
+
+js
+if (b.w >= min && b.h >= min && sum / (b.w * b.h) > .5) out.push(prep(b));
+
+por:
+
+js
+if (b.w >= min && b.h >= min && sum / (b.w * b.h) > .5)
+  splitBox(d, W, b, min).forEach(p => { if (p.w >= min && p.h >= min) out.push(prep(p)); });
+
+Usa solo d, W, min, prep y out, que ya existen en detect(). order(), prep() y el resto del flujo quedan intactos. Si un componente no tiene corte, splitBox devuelve [b] y el comportamiento es el de antes.
